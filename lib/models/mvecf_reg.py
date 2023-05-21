@@ -22,13 +22,7 @@ class MVECF_reg(SVD):
 
         self.gamma = gamma
         self.val_loss_mv = 0
-
-        self.num_holding = []
-        for user in range(self.n_users):
-            index_start = self.train_indptr[user]
-            index_end = self.train_indptr[user + 1]
-            self.num_holding.append(index_end - index_start)
-        self.num_holding = np.array(self.num_holding).reshape(-1, 1)
+        self.train_loss_mv = 0
 
         sig2_M = self.factor_params["factor_variance"]
         beta = self.factor_params["beta"]
@@ -37,7 +31,21 @@ class MVECF_reg(SVD):
         self.diag_Sigma = np.diag(Sigma)
         self.off_diag_Sigma = Sigma - np.diag(self.diag_Sigma)
 
-        self.params_not_save += ["factor_params", "diag_Sigma", "off_diag_Sigma", "num_holding"]
+        self.params_not_save += ["factor_params", "diag_Sigma", "off_diag_Sigma"]
+
+    def fit_epoch(self, shuffle=True):
+        self.train_loss_mv = 0
+        estimate_ui = super(MVECF_reg, self).fit_epoch(shuffle)
+        self.train_loss_mv = self.cal_mv_loss(estimate_ui)
+        self.train_loss += self.reg_param_mv * self.train_loss_mv
+
+    def cal_mv_loss(self, estimate_ui):
+        mu_i = np.matmul(self.factor_params["beta"], self.factor_params["factor_mean"])
+        loss_mv = self.gamma / 2 * (
+                estimate_ui ** 2 * self.diag_Sigma
+                + estimate_ui * np.matmul(estimate_ui, self.off_diag_Sigma)
+        ) - mu_i * estimate_ui
+        return loss_mv.sum()
 
     def update(self, user, item, rating, weight):
         pud = deepcopy(self.pu[user])
@@ -60,10 +68,10 @@ class MVECF_reg(SVD):
         Sigma_i_T_Q = np.matmul(beta_i, VBTQ) + sig2_epsQ[item]  # batchsize by numfactor
         pu_QT_Sigma_i = (pud * Sigma_i_T_Q).sum(axis=1, keepdims=True)
 
-        grad_mv_by_pud = self.gamma / self.num_holding[user] / 2 * (
+        grad_mv_by_pud = self.gamma / 2 * (
                 pu_QT_Sigma_i * qid + estimate_ui.reshape(-1, 1) * Sigma_i_T_Q
         ) - mu_i * qid
-        grad_mv_by_qid = self.gamma / self.num_holding[user] * pu_QT_Sigma_i * pud - mu_i * pud
+        grad_mv_by_qid = self.gamma * pu_QT_Sigma_i * pud - mu_i * pud
 
         # update factors
         self.pu[user] += self.lr * (
@@ -84,10 +92,9 @@ class MVECF_reg(SVD):
         mu_i = (beta_i * mu_M).sum(axis=1, keepdims=True)
 
         estimate_ui = estimate_ui.reshape(-1, 1)
-        loss = self.gamma / self.num_holding[user] / 2 * (
+        loss_mv = self.gamma / 2 * (
                 estimate_ui ** 2 * self.diag_Sigma[item].reshape(-1, 1)
                 + estimate_ui * (pud * np.matmul(self.off_diag_Sigma, self.qi)[item]).sum(axis=1, keepdims=True)
         ) - mu_i * estimate_ui
-
-        self.val_loss_mv = loss.sum()
+        self.val_loss_mv = loss_mv.sum()
         self.val_loss += self.reg_param_mv * self.val_loss_mv

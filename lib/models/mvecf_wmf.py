@@ -25,12 +25,7 @@ class MVECF_WMF(SVD):
         self.reg_param2 = reg_param2
         self.gamma = gamma
         self.val_loss_mv = 0
-        beta = self.factor_params["beta"]
-        self.avg_true_beta = []
-        for user in range(self.n_users):
-            train_items = self.train_data[1][self.train_indptr[user]:self.train_indptr[user + 1]]
-            self.avg_true_beta.append(beta[train_items].mean(axis=0))
-        self.avg_true_beta = np.array(self.avg_true_beta)
+        self.train_loss_mv = 0
 
         sig2_M = self.factor_params["factor_variance"]
         beta = self.factor_params["beta"]
@@ -39,32 +34,41 @@ class MVECF_WMF(SVD):
         self.diag_Sigma = np.diag(Sigma)
         self.off_diag_Sigma = Sigma - np.diag(self.diag_Sigma)
 
+        self.mu_items = self.cal_item_means()
+
         # generate dense rating and weight
         self.dense_rating = []
         self.dense_weight = []
+        self.avg_true_beta = []
         self.num_holding = []
         for user in range(self.n_users):
             index_start = self.train_indptr[user]
             index_end = self.train_indptr[user + 1]
+            train_items = self.train_data[1][index_start:index_end]
+            train_ratings = self.train_data[2][index_start:index_end]
             self.num_holding.append(index_end - index_start)
-            train_items = np.append(self.train_data[1][index_start:index_end], self.n_items + 1)
-            train_ratings = np.append(self.train_data[2][index_start:index_end], 0)
+            self.avg_true_beta.append(beta[train_items].mean(axis=0))
             i_user, r_user, w_user = self._get_total_items_ratings_init(user, train_items, train_ratings)
-
             self.dense_rating.append(r_user)
             self.dense_weight.append(w_user)
+
         self.num_holding = np.array(self.num_holding)
+        self.sum_true_cov = np.matmul(self.csr_train.toarray(), self.off_diag_Sigma)
+        self.avg_true_beta = np.array(self.avg_true_beta)
+
         self.dense_rating = np.array(self.dense_rating)
         self.dense_rating = self.dense_rating - self.dense_rating.mean()
         self.dense_weight = np.array(self.dense_weight)
         self.params_not_save += [
-            "factor_params", "diag_Sigma", "off_diag_Sigma", "sum_of_true_beta", "dense_rating", "dense_weight",
-            "num_holding"
+            "factor_params", "diag_Sigma", "off_diag_Sigma", "mu_items", "dense_rating", "dense_weight",
+            "num_holding", "sum_true_cov", "avg_true_beta"
         ]
+
+    def cal_item_means(self):
+        return np.matmul(self.factor_params["beta"], self.factor_params["factor_mean"])
 
     def _get_total_items_ratings_init(self, user, train_items, train_ratings):
         beta = self.factor_params["beta"]
-        mu_M = self.factor_params["factor_mean"]
         sig2_M = self.factor_params["factor_variance"]
         iter_train_items_raitings = iter(zip(train_items, train_ratings))
 
@@ -74,21 +78,23 @@ class MVECF_WMF(SVD):
         # initialize
         i_train, r_train = next(iter_train_items_raitings)
         # start
-        for i, beta_i, sig2_i in zip(range(self.n_items), beta, self.diag_Sigma):
+        for i, mu_i, beta_i, sig2_i in zip(range(self.n_items), self.mu_items, beta, self.diag_Sigma):
             prev_weight = 1
             prev_rating = 0
             if i == i_train:
                 prev_weight = self.alpha
                 prev_rating = r_train
-                i_train, r_train = next(iter_train_items_raitings)
-
+                try:
+                    i_train, r_train = next(iter_train_items_raitings)
+                except StopIteration:
+                    i_train = self.n_items
+                    r_train = 0
             mv_weight = self.gamma / 2 * self.reg_param_mv * sig2_i
             avg_true_beta = self.avg_true_beta[user] - beta_i / self.num_holding[user] * prev_rating
-            mv_rating = (beta_i * (mu_M / self.gamma - np.matmul(avg_true_beta, sig2_M) / 2)).sum() / sig2_i
+            mv_rating = (mu_i / self.gamma - (beta_i * np.matmul(avg_true_beta, sig2_M) / 2).sum()) / sig2_i
             weight = prev_weight + mv_weight
             rating = (prev_weight * prev_rating + mv_weight * mv_rating) / weight
-            if np.isnan(rating):
-                a = -1
+
             tmp_item.append(i)
             tmp_rating.append(rating)
             tmp_weight.append(weight)
@@ -101,56 +107,33 @@ class MVECF_WMF(SVD):
 
     def calculate_valloss(self):
         print("calculating validation loss")
-        # rec loss (does not affect early stopping)
-        u_total = self.valid_data[0]
-        i_total = self.valid_data[1]
-        r_total = self.valid_data[2]
-        w_total = (1 - r_total) + r_total * self.alpha
-        pud = self.pu[u_total]
-        qid = self.qi[i_total]
-        r_predict = np.sum(pud * qid, axis=1)
-        self.val_loss_rec = (w_total * (r_total - r_predict) ** 2).sum()
-
-        # mv loss (does not affect early stopping)
-        mu_M = self.factor_params["factor_mean"]
-        beta = self.factor_params["beta"]
-        beta_i = beta[i_total]
-        mu_i = (beta_i * mu_M).sum(axis=1, keepdims=True)
-
-        estimate_ui = r_predict.reshape(-1, 1)
-        loss = self.gamma / 2 * (
-                estimate_ui ** 2 * self.diag_Sigma[i_total].reshape(-1, 1)
-                + estimate_ui * (pud * np.matmul(self.off_diag_Sigma, self.qi)[i_total]).sum(axis=1, keepdims=True)
-        ) - mu_i * estimate_ui
-        self.val_loss_mv = loss.sum()
-
         # validation
         beta = self.factor_params["beta"]
-        mu_M = self.factor_params["factor_mean"]
         sig2_M = self.factor_params["factor_variance"]
 
         self.val_loss = 0
         self.map_valid = 0
+        # weight and rating for validation set are not modified in self.__init__
         for user in range(self.n_users):
             index = range(self.valid_indptr[user], self.valid_indptr[user + 1])
             items = self.valid_data[1][index]
 
             beta_i = beta[items]
+            mu_i = self.mu_items[items].reshape(-1, 1)
             sig2_i = self.diag_Sigma[items].reshape(-1, 1)
 
             prev_rating = self.valid_data[2][index].reshape(-1, 1)
             prev_weight = (1 - prev_rating) + prev_rating * self.alpha
 
+            avg_true_beta = self.avg_true_beta[user] - beta_i / self.num_holding[user] * prev_rating
             mv_weight = self.gamma / 2 * self.reg_param_mv * sig2_i
-            mv_rating = (
-                                beta_i * (mu_M / self.gamma - np.matmul(self.avg_true_beta[user], sig2_M) / 2)
-                        ).sum(axis=1, keepdims=True) / sig2_i
+            mv_rating = (mu_i / self.gamma
+                         - (beta_i * np.matmul(avg_true_beta, sig2_M) / 2).sum(axis=1, keepdims=True)) / sig2_i
             weight = prev_weight + mv_weight
             rating = (prev_weight * prev_rating + mv_weight * mv_rating) / weight
 
             weight = weight.flatten()
             rating = rating.flatten()
-            # weight = np.clip(weight, 0, self.base_weight * self.alpha)
             estimate = np.matmul(self.pu[user], self.qi[items].T)
             self.val_loss += (weight * (rating - estimate) ** 2).sum()
 
@@ -171,6 +154,24 @@ class MVECF_WMF(SVD):
 
         self.pu = recompute_factors_batched(self.qi, S, self.dense_rating, lambda_pu_reg, dtype=dtype)
         self.qi = recompute_factors_batched(self.pu, S.T, self.dense_rating.T, lambda_qi_reg, dtype=dtype)
+
+        print("calculating train loss")
+        r_predict = np.matmul(self.pu, self.qi.T)
+        reg_loss = self.reg_param * ((self.pu ** 2).sum() + (self.qi ** 2).sum())
+        self.train_loss = (self.dense_weight * (self.dense_rating - r_predict) ** 2).sum() + reg_loss
+
+        dense_train_data = self.csr_train.toarray()
+        rec_weight = (1 - dense_train_data) + dense_train_data * self.alpha
+        self.train_loss_rec = (rec_weight * (dense_train_data - r_predict) ** 2).sum()
+        self.train_loss_mv = self.cal_mv_loss(r_predict)
+
+    def cal_mv_loss(self, estimate_ui):
+        mu_i = np.matmul(self.factor_params["beta"], self.factor_params["factor_mean"])
+        loss_mv = self.gamma / 2 * (
+                estimate_ui ** 2 * self.diag_Sigma
+                + estimate_ui * self.sum_true_cov / self.num_holding.reshape(-1, 1)
+        ) - mu_i * estimate_ui
+        return loss_mv.sum()
 
 
 def solve_sequential(As, Bs):

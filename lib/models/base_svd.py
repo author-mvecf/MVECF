@@ -17,9 +17,9 @@ __all__ = [
 
 
 class SVD(object):
-    def __init__(self, data, n_factors=30, n_epochs=100, lr=0.001, reg_param=0.001,
+    def __init__(self, data, n_factors=30, n_epochs=100, lr=0.001, reg_param=0.001, verbose=1,
                  early_stop=True, alpha=10, batch_size=128, tmp_save_path=None, tmp_load_path=None, ):
-
+        self.verbose = verbose
         if data is not None:
             self.train_data = data["train_data"]
             self.train_indptr = data["train_indptr"]
@@ -27,13 +27,17 @@ class SVD(object):
             self.valid_indptr = data["valid_indptr"]
             self.n_users = data["n_users"]
             self.n_items = data["n_items"]
+            self.csr_train = csr_matrix(
+                (self.train_data[2], (self.train_data[0], self.train_data[1])), shape=(self.n_users, self.n_items)
+            )  # to calculate train error fast
         else:
             self.train_data = None
             self.train_indptr = None
             self.n_users = 0
             self.n_items = 0
+            self.csr_train = None
         self.list_stop_cri = []
-        self.is_early_stop = early_stop
+        self.early_stop = early_stop
 
         self.tmp_save_path = tmp_save_path
         self.tmp_load_path = tmp_load_path
@@ -58,7 +62,7 @@ class SVD(object):
 
         self.params_not_save = [
             "start_epoch", "train_data", "test_data", "valid_data", "valid_indptr", "train_indptr", "test_indptr",
-            "tmp_load_path", "tmp_save_path", "n_epochs", "is_early_stop"
+            "tmp_load_path", "tmp_save_path", "n_epochs", "early_stop", "csr_train"
         ]
 
     def __call__(self, rows, cols):
@@ -76,8 +80,9 @@ class SVD(object):
 
     def save_variables(self, finished_epoch):
         if self.tmp_save_path is not None:
+            if not os.path.exists(self.tmp_save_path):
+                os.makedirs(self.tmp_save_path)
             next_start_epoch = finished_epoch + 1
-
             attr_list = [("start_epoch", next_start_epoch)]
             for i in inspect.getmembers(self):
                 if not i[0].startswith('_'):
@@ -103,7 +108,7 @@ class SVD(object):
         if self.tmp_load_path is not None:
             variable_dict = load_pickle(self.tmp_load_path)
             for key, value in variable_dict.items():
-                if key != "n_epochs" or key != "is_early_stop":
+                if key != "n_epochs" or key != "early_stop":
                     setattr(self, key, value)
 
     def _get_total_items_ratings(self, user, train_items, train_ratings):
@@ -123,7 +128,11 @@ class SVD(object):
                 item = i
                 rating = r_train
                 weight = self.alpha
-                i_train, r_train = next(iter_train_items_raitings)
+                try:
+                    i_train, r_train = next(iter_train_items_raitings)
+                except StopIteration:
+                    i_train = self.n_items
+                    r_train = 0
             tmp_item.append(item)
             tmp_rating.append(rating)
             tmp_weight.append(weight)
@@ -141,8 +150,8 @@ class SVD(object):
         for u in user_range:
             index_start = self.train_indptr[u]
             index_end = self.train_indptr[u + 1]
-            train_items = np.append(self.train_data[1][index_start:index_end], self.n_items + 1)
-            train_ratings = np.append(self.train_data[2][index_start:index_end], 0)
+            train_items = self.train_data[1][index_start:index_end]
+            train_ratings = self.train_data[2][index_start:index_end]
 
             i_user, r_user, w_user = self._get_total_items_ratings(u, train_items, train_ratings)
             u_total.append(np.ones(len(i_user)) * u)
@@ -176,7 +185,8 @@ class SVD(object):
         total_user_range = np.arange(self.n_users)
         np.random.shuffle(total_user_range)
         for partition in range(num_partition):
-            print("generating rating partition {}".format(partition))
+            if self.verbose:
+                print("generating rating partition {}".format(partition))
             start_idx = partition * int(self.n_users / num_partition)
             if partition == num_partition - 1:
                 end_idx = self.n_users
@@ -184,7 +194,8 @@ class SVD(object):
                 end_idx = (partition + 1) * int(self.n_users / num_partition)
             user_range = total_user_range[start_idx:end_idx]
             u_total, i_total, r_total, w_total = self.gen_rating_pairs(user_range, shuffle=shuffle)
-            print("updating rating parameters..")
+            if self.verbose:
+                print("updating rating parameters..")
             time.sleep(0.1)
             for batch in tqdm(range(len(i_total))):
                 batch_u = u_total[batch]
@@ -193,17 +204,26 @@ class SVD(object):
                 batch_w = w_total[batch]
                 self.update(batch_u, batch_i, batch_r, batch_w)
 
-        self.train_loss += self.train_loss_rec
+        r_predict = np.matmul(self.pu, self.qi.T)
+        reg_loss = self.reg_param * ((self.pu ** 2).sum() + (self.qi ** 2).sum())
+        dense_train_data = self.csr_train.toarray()
+        rec_weight = (1 - dense_train_data) + dense_train_data * self.alpha
+        self.train_loss_rec = (rec_weight * (dense_train_data - r_predict) ** 2).sum()
+        self.train_loss = self.train_loss_rec + reg_loss
+        return r_predict
 
-    def early_stop(self):
-        if len(self.list_stop_cri) >= 30:
-            if self.list_stop_cri[-30] <= min(self.list_stop_cri[-30:]) \
-                    or np.all(max(abs(np.diff(self.list_stop_cri[-30:]))) < 0):
-                return True
-        return False
+    def check_early_stop(self):
+        list_stop_cri = self.list_stop_cri[-30:]
+        if len(list_stop_cri) >= 30 and (
+                list_stop_cri[0] <= min(list_stop_cri) or abs(list_stop_cri[0]-list_stop_cri[-1]) < 1
+        ):
+            return list_stop_cri[0]
+        else:
+            return None
 
     def calculate_valloss(self):
-        print("calculating validation loss")
+        if self.verbose:
+            print("calculating validation loss")
         self.val_loss = 0
 
         u_total = self.valid_data[0]
@@ -223,7 +243,8 @@ class SVD(object):
             tmp_score = y_score[self.valid_indptr[user]:self.valid_indptr[user + 1]]
             self.map_valid += average_precision_score(tmp_true, tmp_score)
         self.map_valid = self.map_valid / self.n_users
-        print("validation MAP: {}".format(self.map_valid))
+        if self.verbose:
+            print("validation MAP: {}".format(self.map_valid))
         return pud, qid, r_predict
 
     def fit(self):
@@ -231,38 +252,38 @@ class SVD(object):
         self.load_variables()
         for current_epoch in range(self.start_epoch, self.n_epochs + 1):
             start_time = time.time()
-            print("\nProcessing epoch {}".format(current_epoch))
-            print(self.tmp_save_path)
+            if self.verbose:
+                print("\nProcessing epoch {}".format(current_epoch))
+                print(self.tmp_save_path)
             self.fit_epoch()
             if not np.isfinite(self.train_loss) or np.isnan(self.train_loss) or np.isnan(self.val_loss):
                 break
             self.calculate_valloss()
             self.list_stop_cri.append(self.val_loss)
             elapsed_time = time.time() - start_time
-            print("\nelapsed time: {}, train loss: {}, validation loss: {}".format(
-                elapsed_time, self.train_loss, self.val_loss
-            ))
+            if self.verbose:
+                print("\nelapsed time: {}, train loss: {}, validation loss: {}".format(
+                    elapsed_time, self.train_loss, self.val_loss
+                ))
             self.save_variables(current_epoch)
-            if self.is_early_stop:
-                if self.early_stop():
-                    break
+            if self.early_stop:
+                flag = self.check_early_stop()
+                if flag:
+                    return flag
+        return self.list_stop_cri[-1]
 
 
 class SVD_als(SVD):
-    def __init__(self, data, n_factors=30, n_epochs=100, lr=0.001, reg_param=0.001,
+    def __init__(self, data, n_factors=30, n_epochs=100, lr=0.001, reg_param=0.001, verbose=1,
                  early_stop=True, alpha=10, batch_size=128, tmp_save_path=None, tmp_load_path=None,
                  reg_param2=None, ):
-        super(SVD_als, self).__init__(data=data, n_factors=n_factors, n_epochs=n_epochs,
+        super(SVD_als, self).__init__(data=data, n_factors=n_factors, n_epochs=n_epochs, verbose=verbose,
                                       lr=lr, early_stop=early_stop, reg_param=reg_param,
                                       alpha=alpha, batch_size=batch_size, tmp_save_path=tmp_save_path,
                                       tmp_load_path=tmp_load_path, )
         if reg_param2 is None:
             reg_param2 = reg_param
         self.reg_param2 = reg_param2
-        self.csr_train = csr_matrix(
-            (self.train_data[2], (self.train_data[0], self.train_data[1])), shape=(self.n_users, self.n_items)
-        )
-        self.params_not_save += ["csr_train"]
 
     def fit_epoch(self, shuffle=True):
         lambda_pu_reg = self.reg_param
@@ -275,3 +296,10 @@ class SVD_als(SVD):
         self.pu = recompute_factors_batched(self.qi, S, lambda_pu_reg, dtype=dtype)
         ST = S.T.tocsr()
         self.qi = recompute_factors_batched(self.pu, ST, lambda_qi_reg, dtype=dtype)
+
+        r_predict = np.matmul(self.pu, self.qi.T)
+        reg_loss = self.reg_param * ((self.pu ** 2).sum() + (self.qi ** 2).sum())
+        dense_train_data = self.csr_train.toarray()
+        rec_weight = (1 - dense_train_data) + dense_train_data * self.alpha
+        self.train_loss_rec = (rec_weight * (dense_train_data - r_predict) ** 2).sum()
+        self.train_loss = self.train_loss_rec + reg_loss

@@ -7,7 +7,6 @@ holdings_data, factor_params = get_data("CRSP", 2012)
 gamma = 3
 latent_dim = 30
 reg_param = 0.001
-reg_param_mv = 10
 
 dirpath = os.path.join(root_path, "results/wmf")
 print(dirpath)
