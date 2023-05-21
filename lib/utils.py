@@ -92,15 +92,14 @@ def check_stop_flag(dirpath):
     order = [int(x.split("epoch_")[1].split(".pkl")[0]) for x in tmp]
     order = np.argsort(order)
     tmp = list(np.array(tmp)[order])
-    print(dirpath)
 
     if not len(tmp) == 0:
         load_path = os.path.join(dirpath, tmp[-1])
 
         data = load_pickle(load_path)
-        list_stop_cri = data["list_stop_cri"][-10:]
-        if len(list_stop_cri) >= 10 and (
-                list_stop_cri[0] <= min(list_stop_cri) or np.all(max(abs(np.diff(list_stop_cri))) < 0)):
+        list_stop_cri = data["list_stop_cri"][-30:]
+        if len(list_stop_cri) >= 30 and (
+                list_stop_cri[0] <= min(list_stop_cri) or np.all(max(abs(np.diff(list_stop_cri))) < 1)):
             stop_flag = True
 
     return stop_flag, load_path
