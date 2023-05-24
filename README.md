@@ -2,8 +2,8 @@
 
 
 ## Introduction
-Mean Variance Efficient Collaborative Filtering (MVECF) is a recommender system for stock recommendation that specifically designed to improve the pareto optimality in a trade-off between risk and return (i.e., the mean-variance efficiency) of recommended portfolios. We utilize the regularization technique to ensure that the recommendation is made based on the user’s current portfolio while increasing diversification effect. We further restructure the model to ordinary weighted matrix factorization form so that MVECF can be performed by only chaging the target rating. This modified rating is also used to incoporate MVECF to state-of-the-art graph based ranking models.
-This repository contains python codes for MVECF and Baseline models (BPR, WMF, and LightGCN). Sample data and analysis codes are included.
+Mean Variance Efficient Collaborative Filtering (MVECF) is a recommender system for stock recommendation that specifically designed to improve the pareto optimality in a trade-off between risk and return (i.e., the mean-variance efficiency) of recommended portfolios. Regularization technique is used to ensure that the recommendation is made based on the user’s current portfolio while increasing diversification effect. MVECF is further restructured to ordinary weighted matrix factorization form and it can be performed by only chaging the target ratings. This modified ratings can be used in the negative sampling in the state-of-the-art graph based ranking models to incoporate MVECF.
+This repository contains python codes for MVECF, baseline models (BPR, WMF, and LightGCN), analysis codes and sample data.
 
 ## Environment
 The codes of MVECF are implemented and tested under the following development environment:
